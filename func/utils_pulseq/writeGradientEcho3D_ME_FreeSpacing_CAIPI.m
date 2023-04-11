@@ -21,7 +21,13 @@ function   [ seq, SeqParamsEff]  = writeGradientEcho3D_ME_FreeSpacing_CAIPI (Seq
 % SeqParams.rfphasecycle    the rf phase cycle phase desired (in degrees)
 % SeqParams.readoutSpoil    number of 2pi cycles in readout direction
 % SeqParams.readoutOversampling    readout Oversampling siemens uses Factor
-% of 2
+% 2
+% SeqParams.WaterExcite    {1 or 0} 1 binomial pulse is used default is zero
+% SeqParams.res_nav    spatial resolution aimed for the mc navigator,
+% default 8e-3
+% SeqParams.MinBwPerPixel    if 1, min BW per pixel is used (overriding Tread), default is
+% zero, 
+
 
 %%
 % clear
@@ -123,6 +129,26 @@ if isfield(SeqParams,'readoutOversampling')
 else
     readoutOversampling = 1; % doesn't Oversample
 end
+if isfield(SeqParams,'res_nav');
+    res_nav = SeqParams.res_nav;
+else
+    res_nav = 8e-3; % resolution associated with the navigator  8mm for convenience
+end
+
+if isfield(SeqParams,'WaterExcite');
+    WaterExcite = SeqParams.WaterExcite;
+else
+    WaterExcite = 0; % just one water RF pulse is used
+end
+% we could eventually have better and shorter water extitation RF pulses
+% https://onlinelibrary.wiley.com/doi/full/10.1002/mrm.26965
+
+
+if isfield(SeqParams,'MinBwPerPixel');
+    MinBwPerPixel = SeqParams.MinBwPerPixel;
+else
+    MinBwPerPixel = 0; % Readout gradient Rephaser will not have min duration
+end
 
 
 % SeqParams.readoutSpoil    number of 2pi cycles in readout direction
@@ -141,7 +167,7 @@ res = FOV/dims;
 
 %% Define downsampling pattern, the given pattern defines the new effective FOV Nx, Ny, Nz
 if useMCnavigator
-    res_nav = 8e-3; % resolution associated with the navigator  8mm for convenience
+
     dimsNav =ceil(dims./(res_nav/res)); % this defines the navigator region
 end
 
@@ -168,9 +194,17 @@ SeqParamsEff.FOV = FOV;
 %%
 seq=mr.Sequence(sys);           % Create a new sequence object
 
-% Create non-selective pulse
-[rf, rfDelay] = mr.makeBlockPulse(FlipAngle*pi/180,sys,'Duration',0.2e-3);
-
+if WaterExcite == 0
+    % Create non-selective pulse
+    [rf, rfDelay] = mr.makeBlockPulse(FlipAngle*pi/180,sys,'Duration',0.2e-3);
+    rfTotalDelay = rfDelay.delay;
+else
+    [rf, rfDelay] = mr.makeBlockPulse(FlipAngle/2*pi/180,sys,'Duration',0.2e-3);
+    [rf0, rf0Delay] = mr.makeBlockPulse(FlipAngle/2*pi/180,sys,'Duration',0.2e-3);
+    rf0Delay.delay = 1.14e-3;
+    display ('spacing between hard pulses was hardcoded for 3T')
+    rfTotalDelay = rfDelay.delay + rf0Delay.delay ;
+end
 % Define other gradients and ADC events
 deltak=1./FOV;
 
@@ -179,9 +213,20 @@ deltak=1./FOV;
 if and(defineEchoTimes,isempty(Tread))
     Tread = [TE(1)]; %initialization the readout time as long as first echo time
     if length(TE)>1
-        Tread = 4/5 * min(diff(TE)); % it starts with an assumption that a large fraction of the time is for readout with 4/5 you only loose 10% of SNR in respect to acqioring all the time
-        Tread = min ([TE(1) , Tread ]);
+                Tread = 4/5 * min(diff(TE)); % it starts with an assumption that a large fraction of the time is for readout with 4/5 you only loose 10% of SNR in respect to acqioring all the time
+                Tread = min ([TE(1) , Tread ]);
+
+% %             end
     end
+end
+if and(MinBwPerPixel ==1,length(TE)>1)
+    % computes the total read flyback and adds some extra grad raster time for each of the gradient segments and
+    TotalReadFlybackTime = min(diff(TE)) - 7 * seq.gradRasterTime;
+    GradientFlatArea = Nx*deltak(1);
+    GradDirection = FreqPe1Pe2(1);
+    [g_read , g_flyback] = optimise_read_flyback (GradDirection , GradientFlatArea,TotalReadFlybackTime,sys);
+    Tread = ceil(g_read.flatTime/seq.gradRasterTime)*seq.gradRasterTime;
+    %
 end
 
 gx = mr.makeTrapezoid(FreqPe1Pe2(1),'FlatArea',Nx*deltak(1),'FlatTime',Tread,'system',sys);
@@ -199,11 +244,12 @@ Trep_min = mr.calcDuration(gxRep);
 % JPM changed to be used as a frequency navigator, it has to cross kspace
 % center again and go beyond it, so it will have twice the area of gx
 % gxSpoil = mr.makeTrapezoid(FreqPe1Pe2(1),sys,'Area',gx.area*(1+readoutSpoil),'Duration',Tread/2); % arbitrarilly ask the spoiler to have half the duration of the readout
-try 
-gxSpoil = mr.makeTrapezoid(FreqPe1Pe2(1),sys,'Area',gx.area*(1+readoutSpoil),'Duration',Tread); % arbitrarilly ask the spoiler to have half the duration of the readout
+try
+    gxSpoil = mr.makeTrapezoid(FreqPe1Pe2(1),sys,'Area',gx.area*(1+readoutSpoil),'Duration',Tread); % arbitrarilly ask the spoiler to have half the duration of the readout
 catch
-gxSpoil = mr.makeTrapezoid(FreqPe1Pe2(1),sys,'Area',gx.area*(1+readoutSpoil),'amplitude',sys.maxGrad); % arbitrarilly ask the spoiler to have half the duration of the readout    
-end    
+    gxSpoil = mr.makeTrapezoid(FreqPe1Pe2(1),sys,'Area',gx.area*(1+readoutSpoil),'amplitude',sys.maxGrad); % arbitrarilly ask the spoiler to have half the duration of the readout
+end;
+
 adc_nav = mr.makeAdc(Nx,'Duration',(gx.amplitude/gxSpoil.amplitude)*gx.flatTime,'Delay',gxSpoil.riseTime);
 adc_nav.dwell = round(adc_nav.dwell /seq.adcRasterTime) *seq.adcRasterTime; % ensures the timings work...
 
@@ -235,16 +281,17 @@ if defineEchoTimes
         % if all the Echo Times are equally spaced
         delay_after_TE(1:nTE) = seq.gradRasterTime;
         if (min(diff(TE))==max(diff(TE)))
-            Trep = floor((min(diff(TE)) - mr.calcDuration(gx))/seq.gradRasterTime)*seq.gradRasterTime - seq.gradRasterTime;
+            Trep = ceil((min(diff(TE)) - mr.calcDuration(gx))/seq.gradRasterTime)*seq.gradRasterTime - seq.gradRasterTime;
         else
-            Trep = floor((min(diff(TE))-mr.calcDuration(gx))/seq.gradRasterTime)*seq.gradRasterTime - seq.gradRasterTime;
+            Trep = ceil((min(diff(TE))-mr.calcDuration(gx))/seq.gradRasterTime)*seq.gradRasterTime - seq.gradRasterTime;
             delay_after_TE(1:(nTE-1)) = seq.gradRasterTime + diff(TE)-min(diff(TE));
         end
     end
 else
     % TRrep (time to fill with echo times / number of echo times minus the readout time - it should be the time to apply the refocusing)
     nTE = nTEmax;
-    Trep = floor((TimeToFillWithEchotimes/nTE - mr.calcDuration(gx))/seq.gradRasterTime)*seq.gradRasterTime - seq.gradRasterTime;
+%     Trep = floor((TimeToFillWithEchotimes/nTE - mr.calcDuration(gx))/seq.gradRasterTime)*seq.gradRasterTime - seq.gradRasterTime;
+    Trep = ceil((TimeToFillWithEchotimes/nTE - mr.calcDuration(gx))/seq.gradRasterTime)*seq.gradRasterTime - seq.gradRasterTime;
     delay_after_TE(1:nTE) = seq.gradRasterTime;
     TE = mr.calcDuration(rf)/2 + mr.calcDuration(gxPre) + mr.calcDuration(gx)/2 + [0:(nTE-1)] * (mr.calcDuration(gx) + Trep );
 end;
@@ -255,10 +302,10 @@ delayTE = floor((TE(1) - mr.calcDuration(rf) + mr.calcRfCenter(rf) + rf.delay - 
     - mr.calcDuration(gx)/2)/seq.gradRasterTime)*seq.gradRasterTime;
 % delayTR = ceil((TR - mr.calcDuration(rf) - mr.calcDuration(gxPre) ...
 %     - (mr.calcDuration(gx) + Trep ) *nTE - delayTE - mr.calcDuration(gxSpoil))/seq.gradRasterTime)*seq.gradRasterTime;
-delayTR = ceil((TR - mr.calcDuration(rfDelay) - mr.calcDuration(gxPre) ...
+delayTR = ceil((TR - rfTotalDelay - mr.calcDuration(gxPre) ...
     - (mr.calcDuration(gx) + Trep ) *nTE - sum(delay_after_TE) - delayTE - mr.calcDuration(gxSpoil))/seq.gradRasterTime)*seq.gradRasterTime;
 
-TReff = ((mr.calcDuration(rfDelay) + mr.calcDuration(gxPre) ...
+TReff = ((rfTotalDelay + mr.calcDuration(gxPre) ...
     + (mr.calcDuration(gx) + Trep ) *nTE + sum(delay_after_TE) +delayTE + delayTR + mr.calcDuration(gxSpoil)));
 
 if delayTE*delayTR<0 % checks if ones of those is negative, a possibility when explicitely defining TEs
@@ -290,11 +337,11 @@ SeqParamsEff.res = res;
 SeqParamsEff.TR = TReff;
 for k=1:nTE
     try
-        SeqParamsEff.TEff(k) = mr.calcDuration(rfDelay) + delayTE + mr.calcDuration(gxPre) ...
+        SeqParamsEff.TEff(k) = rfTotalDelay + delayTE + mr.calcDuration(gxPre) ...
             + (mr.calcDuration(gx) + Trep ) * (k-1) + sum(delay_after_TE(1:k-1))  + mr.calcDuration(gx)/2 ;
     catch % deals with the first echo
-        SeqParamsEff.TEff(1) = mr.calcDuration(rfDelay) + delayTE + mr.calcDuration(gxPre) ...
-            + mr.calcDuration(gx)/2 ;
+        SeqParamsEff.TEff(1) = rfTotalDelay + delayTE + mr.calcDuration(gxPre) ...
+%             + mr.calcDuration(gx)/2 ;
     end
 end
 SeqParamsEff.Tread = Tread;
@@ -306,7 +353,8 @@ SeqParamsEff.Tpre = Tpre;
 SeqParamsEff.Ndummy = Ndummy;
 %% compute sampling patterns and trajectories
 % this part is for the whole (undersampled) k-space
-KspaceMaskKyKzt = kspacepattern_filling_order ([Nx,Ny,Nz,nTE],pat,[floor(Ry/2) round(CaipiShift/2)] ); % the shift across echos is a fraction of the caipishift
+KspaceMaskKyKzt = kspacepattern_filling_order ([Nx,Ny,Nz,nTE],pat,[floor(Ry/2) round(CaipiShift/2)] ); 
+% the shift across echos is a fraction of the caipishift
 labelData0_Nav1 = zeros ([1 max(KspaceMaskKyKzt(:))]); % 0 given to Data, 1 given to MCnavdata
 SeqParamsEff.KspaceMaskKyKzt = KspaceMaskKyKzt;
 
@@ -334,7 +382,8 @@ end;
 SeqParamsEff.labelData0_Nav1 = labelData0_Nav1;
 SeqParamsEff.TotalAcquisitionTime = (length(labelData0_Nav1)+Ndummy) * SeqParamsEff.TR;
 
-% check Unique Readout Trajectories (After Prephased and before Rephaser)-  eventually important for GE version
+%% check Unique Readout Trajectories (After Prephased and before Rephaser)-  eventually important for GE version
+% only relevant for the GE implementation
 iShotData = 0;
 iShotNav = 0;
 iShotUniqueWaveform =0;
@@ -430,7 +479,7 @@ end
 %     gzReph(iZ).id = seq.registerGradEvent(gzReph(iZ));
 % end
 
-gxRep = mr.makeTrapezoid(FreqPe1Pe2(1),sys,'Area',-gx.area,'Duration',Trep);
+gxRep = mr.makeTrapezoid(FreqPe1Pe2(1),'system', sys,'Area',-gx.area,'Duration',Trep);
 
 % preregister constant objects to accelerate computations
 % this is not necessary, but accelerates the sequence creation by up to a factor of 2
@@ -446,6 +495,9 @@ gxRep.id = seq.registerGradEvent(gxRep);
 for iY=1:Ndummy
     % RF
     rf.phaseOffset = mod(rfphasecycle*(iY^2+iY+2)*pi/180,2*pi);
+    if WaterExcite
+    seq.addBlock(rf0,rf0Delay);
+    end
     seq.addBlock(rf,rfDelay);
     % Gradients
     seq.addBlock(gxPre,gyPre(round(Ny/2)),gzPre(round(Nz/2)));
@@ -487,6 +539,9 @@ for iShot=1:length(labelData0_Nav1)
     adc_nav.phaseOffset  = rf.phaseOffset;
 
     % Excitation
+    if WaterExcite
+    seq.addBlock(rf0,rf0Delay);
+    end
     seq.addBlock(rf,rfDelay);
     
     % Encoding
